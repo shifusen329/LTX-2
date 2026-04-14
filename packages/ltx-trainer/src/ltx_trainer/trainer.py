@@ -285,7 +285,7 @@ class LtxvTrainer:
                         self._sigma_tracker.update(output.sigma.cpu().tolist(), output.loss.detach().cpu().tolist())
                         metrics = {
                             "train/loss": step_loss,
-                            "train/learning_rate": current_lr,
+                            "train/lr": current_lr,
                             "train/step_time": step_time,
                             "train/global_step": self._global_step,
                         }
