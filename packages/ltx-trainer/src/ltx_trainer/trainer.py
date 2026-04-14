@@ -209,6 +209,7 @@ class LtxvTrainer:
                     batch = next(data_iter)
 
                 step_start_time = time.time()
+                grad_norm: float | None = None
                 with self._accelerator.accumulate(self._transformer):
                     is_optimization_step = (step + 1) % cfg.optimization.gradient_accumulation_steps == 0
                     if is_optimization_step:
@@ -218,10 +219,12 @@ class LtxvTrainer:
                     self._accelerator.backward(output.loss.mean())
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
-                        self._accelerator.clip_grad_norm_(
+                        total_norm = self._accelerator.clip_grad_norm_(
                             self._trainable_params,
                             cfg.optimization.max_grad_norm,
                         )
+                        if total_norm is not None:
+                            grad_norm = total_norm.item() if hasattr(total_norm, "item") else float(total_norm)
 
                     self._optimizer.step()
                     self._optimizer.zero_grad()
@@ -286,6 +289,8 @@ class LtxvTrainer:
                             "train/step_time": step_time,
                             "train/global_step": self._global_step,
                         }
+                        if grad_norm is not None:
+                            metrics["train/grad_norm"] = grad_norm
                         metrics.update(self._sigma_tracker.get_metrics())
                         self._log_metrics(metrics)
 
