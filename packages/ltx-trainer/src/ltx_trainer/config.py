@@ -144,6 +144,12 @@ class OptimizationConfig(ConfigBaseModel):
         description="Parameters for the scheduler",
     )
 
+    warmup_steps: int = Field(
+        default=0,
+        description="Linear warmup steps from 0 to learning_rate before the main scheduler takes over",
+        ge=0,
+    )
+
     enable_gradient_checkpointing: bool = Field(
         default=False,
         description="Enable gradient checkpointing to save memory at the cost of slower training",

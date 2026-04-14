@@ -24,13 +24,14 @@ from torch.optim.lr_scheduler import (
     LinearLR,
     LRScheduler,
     PolynomialLR,
+    SequentialLR,
     StepLR,
 )
 from torch.utils.data import DataLoader
 from torchvision.transforms import functional as F  # noqa: N812
 
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
-from ltx_trainer import logger
+from ltx_trainer import RANK, logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
 from ltx_trainer.datasets import PrecomputedDataset
@@ -50,6 +51,11 @@ from ltx_trainer.video_utils import read_video, save_video
 
 # Disable irrelevant warnings from transformers
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+# Workstation Blackwell GPUs split across NUMA nodes hang on the first NCCL collective
+# when NCCL tries cross-socket PCIe P2P. Force shared-memory/socket transport instead.
+# Override by exporting NCCL_P2P_DISABLE before launch.
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 
 # Silence bitsandbytes warnings about casting
 warnings.filterwarnings(
@@ -90,6 +96,8 @@ class TrainingStepOutput:
 class LtxvTrainer:
     def __init__(self, trainer_config: LtxTrainerConfig) -> None:
         self._config = trainer_config
+        if torch.cuda.is_available():
+            torch.cuda.set_device(RANK)
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
@@ -791,31 +799,34 @@ class LtxvTrainer:
     def _create_scheduler(self, optimizer: torch.optim.Optimizer) -> LRScheduler | None:
         """Create learning rate scheduler based on config."""
         scheduler_type = self._config.optimization.scheduler_type
-        steps = self._config.optimization.steps
+        total_steps = self._config.optimization.steps
+        warmup_steps = self._config.optimization.warmup_steps
         params = self._config.optimization.scheduler_params or {}
 
         if scheduler_type is None:
             return None
+
+        main_steps = max(1, total_steps - warmup_steps)
 
         if scheduler_type == "linear":
             scheduler = LinearLR(
                 optimizer,
                 start_factor=params.pop("start_factor", 1.0),
                 end_factor=params.pop("end_factor", 0.1),
-                total_iters=steps,
+                total_iters=main_steps,
                 **params,
             )
         elif scheduler_type == "cosine":
             scheduler = CosineAnnealingLR(
                 optimizer,
-                T_max=steps,
+                T_max=main_steps,
                 eta_min=params.pop("eta_min", 0),
                 **params,
             )
         elif scheduler_type == "cosine_with_restarts":
             scheduler = CosineAnnealingWarmRestarts(
                 optimizer,
-                T_0=params.pop("T_0", steps // 4),
+                T_0=params.pop("T_0", main_steps // 4),
                 T_mult=params.pop("T_mult", 1),
                 eta_min=params.pop("eta_min", 5e-5),
                 **params,
@@ -823,14 +834,14 @@ class LtxvTrainer:
         elif scheduler_type == "polynomial":
             scheduler = PolynomialLR(
                 optimizer,
-                total_iters=steps,
+                total_iters=main_steps,
                 power=params.pop("power", 1.0),
                 **params,
             )
         elif scheduler_type == "step":
             scheduler = StepLR(
                 optimizer,
-                step_size=params.pop("step_size", steps // 2),
+                step_size=params.pop("step_size", main_steps // 2),
                 gamma=params.pop("gamma", 0.1),
                 **params,
             )
@@ -838,6 +849,19 @@ class LtxvTrainer:
             scheduler = None
         else:
             raise ValueError(f"Unknown scheduler type: {scheduler_type}")
+
+        if warmup_steps > 0 and scheduler is not None:
+            warmup = LinearLR(
+                optimizer,
+                start_factor=1.0 / warmup_steps,
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup, scheduler],
+                milestones=[warmup_steps],
+            )
 
         return scheduler
 
