@@ -3,6 +3,7 @@ import re
 import time
 import warnings
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -10,7 +11,7 @@ import torch
 import wandb
 import yaml
 from accelerate import Accelerator, DistributedType
-from accelerate.utils import set_seed
+from accelerate.utils import InitProcessGroupKwargs, set_seed
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
 from peft.tuners.tuners_utils import BaseTunerLayer
 from peft.utils import ModulesToSaveWrapper
@@ -873,11 +874,19 @@ class LtxvTrainer:
     def _setup_accelerator(self) -> None:
         """Initialize the Accelerator with the appropriate settings."""
 
+        # Extend the NCCL process-group timeout well past the default 10 minutes.
+        # In DDP mode only rank 0 runs validation while other ranks wait at the next
+        # wait_for_everyone() barrier; long validation sampling (many prompts × high
+        # resolution × many inference steps) can exceed the default and trip the
+        # watchdog. 2 hours gives comfortable headroom for worst-case validation.
+        pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=2))
+
         # All distributed setup (DDP/FSDP, number of processes, etc.) is controlled by
         # the user's Accelerate configuration (accelerate config / accelerate launch).
         self._accelerator = Accelerator(
             mixed_precision=self._config.acceleration.mixed_precision_mode,
             gradient_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
+            kwargs_handlers=[pg_kwargs],
         )
 
         if self._accelerator.num_processes > 1:
